@@ -1,0 +1,125 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: devops-python-api
+  CONTAINER_NAME: devops-python-api
+  EC2_TAG_NAME: devops-python-api
+
+jobs:
+  test:
+    name: Testes automatizados
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obter o codigo
+        uses: actions/checkout@v6
+
+      - name: Preparar o Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Instalar dependencias
+        run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Executar testes com pytest
+        run: pytest
+
+  build-and-push:
+    name: Build e publicacao no ECR
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - name: Obter o codigo
+        uses: actions/checkout@v6
+
+      - name: Autenticar na AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Definir a imagem com tag do commit
+        id: meta
+        run: echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Construir a imagem Docker
+        run: docker build --tag "${{ steps.meta.outputs.image }}" .
+
+      - name: Enviar a imagem ao ECR
+        run: docker push "${{ steps.meta.outputs.image }}"
+
+  deploy:
+    name: Deploy na EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Autenticar na AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Atualizar o container na EC2 via SSM
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${EC2_TAG_NAME}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "Nenhuma instancia EC2 em execucao com a tag Name=${EC2_TAG_NAME}"
+            exit 1
+          fi
+          echo "Instancia de destino: $INSTANCE_ID"
+
+          cat > remote.sh <<REMOTE
+          set -e
+          aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REGISTRY}
+          docker pull ${IMAGE}
+          docker rm --force ${CONTAINER_NAME} || true
+          docker run --detach --name ${CONTAINER_NAME} --restart unless-stopped --publish 80:8000 ${IMAGE}
+          sleep 5
+          docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" --format "Container em execucao: {{.Names}} {{.Image}}" | grep ${CONTAINER_NAME}
+          curl --fail --silent http://127.0.0.1:80/health
+          REMOTE
+
+          jq -n --rawfile script remote.sh '{commands: ($script | split("\n") | map(sub("^ +"; "")))}' > params.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${GITHUB_SHA}" \
+            --parameters file://params.json \
+            --query "Command.CommandId" --output text)
+
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" || STATUS=failed
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query "{Status:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}" --output yaml
+          [ -z "$STATUS" ] || exit 1
