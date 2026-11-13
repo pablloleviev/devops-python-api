@@ -76,17 +76,21 @@ Desenvolvedor -> branch -> Pull Request (CI) -> merge na main
 
 ## Acesso a API publicada
 
-- URL: `http://IP-PUBLICO-DA-EC2/` (preenchida apos o primeiro deploy)
-- Documentacao: `http://IP-PUBLICO-DA-EC2/docs`
+- URL: `http://18.212.90.38/`
+- Documentacao: `http://18.212.90.38/docs`
 
 ## Como verificar a versao implantada
 
 ```bash
-curl http://IP-PUBLICO-DA-EC2/health
+curl http://18.212.90.38/health
 ```
 
 A resposta traz o campo `version`, que muda quando o codigo e atualizado e implantado.
 
 ## Evidencias da execucao das pipelines
 
-Os links dos Pull Requests e das execucoes do GitHub Actions estao nas abas **Pull requests** e **Actions** deste repositorio.
+- Pull Request #1 (CI/CD inicial): https://github.com/pablloleviev/devops-python-api/pull/1
+- Pull Request #2 (atualizacao para a versao 1.1.0): https://github.com/pablloleviev/devops-python-api/pull/2
+- Primeiro deploy automatico (Actions): https://github.com/pablloleviev/devops-python-api/actions/runs/43332090814
+- Todas as execucoes: https://github.com/pablloleviev/devops-python-api/actions
+- Imagens no Amazon ECR: repositorio privado `devops-python-api`, com a tag igual ao SHA do commit.
